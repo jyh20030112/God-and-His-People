@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,8 @@ from pydantic import BaseModel, Field
 from simagentplg import ModelConfig
 from game.engine import GameEngine
 from game.leader import LLMLeaderController
+from game.player import move_player, nearby_interactions, player_help, player_trade
+from game.scripted import ScriptedLeaderController
 from game.world import (
     DEFAULT_FACTIONS,
     RESOURCE_TYPES,
@@ -50,6 +54,29 @@ class GodChatRequest(BaseModel):
     message: str = Field(min_length=1)
 
 
+class MoveRequest(BaseModel):
+    direction: str
+
+
+class TradeRequest(BaseModel):
+    faction_id: str
+    offer: dict[str, Any] = Field(default_factory=dict)
+    request: dict[str, Any] = Field(default_factory=dict)
+    risk_level: str = "low"
+
+
+class HelpRequest(BaseModel):
+    kind: str
+    faction_id: str | None = None
+    target: dict[str, int] | None = None
+    x: int | None = None
+    y: int | None = None
+    resource: str | None = None
+    amount: int | None = None
+    weather: str | None = None
+    duration: int | None = None
+
+
 def create_engine(
     *,
     seed: int = 7,
@@ -58,22 +85,56 @@ def create_engine(
     config: ModelConfig | None = None,
 ) -> GameEngine:
     world = create_default_world(width=width, height=height, seed=seed)
-    model_config = config or ModelConfig.from_env()
-    leaders = {
-        faction_id: LLMLeaderController.create(
-            config=model_config,
-            faction_id=faction_id,
-            world_provider=lambda world=world: world,
-        )
-        for faction_id in DEFAULT_FACTIONS
-    }
-    return GameEngine(world, leaders=leaders, log_ticks=True)
+    if config is not None or _has_llm_env():
+        model_config = config or ModelConfig.from_env()
+        leaders = {
+            faction_id: LLMLeaderController.create(
+                config=model_config,
+                faction_id=faction_id,
+                world_provider=lambda world=world: world,
+            )
+            for faction_id in DEFAULT_FACTIONS
+        }
+    else:
+        leaders = {
+            faction_id: ScriptedLeaderController(faction_id)
+            for faction_id in DEFAULT_FACTIONS
+        }
+    return GameEngine(
+        world,
+        leaders=leaders,
+        strategy_interval=None,
+        backup_strategy_interval=20,
+        event_driven_strategy=True,
+        log_ticks=False,
+    )
 
 
-def create_game_app(engine: GameEngine | None = None) -> FastAPI:
-    app = FastAPI(title="SimAgentPlg God Simulator")
+def create_game_app(
+    engine: GameEngine | None = None,
+    *,
+    auto_start: bool = True,
+    tick_seconds: float = 1.2,
+) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if app.state.auto_start:
+            app.state.clock_task = asyncio.create_task(_world_clock(app))
+        try:
+            yield
+        finally:
+            task = app.state.clock_task
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                app.state.clock_task = None
+
+    app = FastAPI(title="SimAgentPlg God Simulator", lifespan=lifespan)
     app.state.engine = engine or create_engine()
     app.state.tick_lock = asyncio.Lock()
+    app.state.clock_task = None
+    app.state.auto_start = auto_start
+    app.state.tick_seconds = tick_seconds
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -83,6 +144,10 @@ def create_game_app(engine: GameEngine | None = None) -> FastAPI:
 
     @app.get("/api/state")
     async def state() -> dict[str, Any]:
+        return serialize_player_state(app.state.engine.world)
+
+    @app.get("/api/debug/state")
+    async def debug_state() -> dict[str, Any]:
         return serialize_state(app.state.engine.world)
 
     @app.post("/api/tick")
@@ -106,7 +171,7 @@ def create_game_app(engine: GameEngine | None = None) -> FastAPI:
             )
         except Exception as exc:
             return _error(exc)
-        return serialize_state(app.state.engine.world)
+        return serialize_player_state(app.state.engine.world)
 
     @app.post("/api/god/weather")
     async def weather(request: WeatherRequest):
@@ -119,7 +184,7 @@ def create_game_app(engine: GameEngine | None = None) -> FastAPI:
             )
         except Exception as exc:
             return _error(exc)
-        return serialize_state(app.state.engine.world)
+        return serialize_player_state(app.state.engine.world)
 
     @app.post("/api/god/answer")
     async def answer(request: AnswerRequest):
@@ -130,7 +195,7 @@ def create_game_app(engine: GameEngine | None = None) -> FastAPI:
             )
         except Exception as exc:
             return _error(exc)
-        return serialize_state(app.state.engine.world)
+        return serialize_player_state(app.state.engine.world)
 
     @app.post("/api/god/chat")
     async def god_chat(request: GodChatRequest):
@@ -165,6 +230,7 @@ def create_game_app(engine: GameEngine | None = None) -> FastAPI:
                     speaker="god",
                     content=message,
                 )
+                world.player.contacted_factions.add(request.faction_id)
                 reply = await chat_method(world)
                 world.add_god_chat_message(
                     faction_id=request.faction_id,
@@ -173,9 +239,73 @@ def create_game_app(engine: GameEngine | None = None) -> FastAPI:
                 )
             except Exception as exc:
                 return _error(exc)
-            return serialize_state(world)
+            return serialize_player_state(world)
+
+    @app.post("/api/player/move")
+    async def player_move(request: MoveRequest):
+        if app.state.tick_lock.locked():
+            return JSONResponse(
+                {"error": "world is already advancing"},
+                status_code=409,
+            )
+        async with app.state.tick_lock:
+            try:
+                move_player(app.state.engine.world, request.direction)
+            except Exception as exc:
+                return _error(exc)
+            return serialize_player_state(app.state.engine.world)
+
+    @app.post("/api/player/trade")
+    async def trade(request: TradeRequest):
+        if app.state.tick_lock.locked():
+            return JSONResponse(
+                {"error": "world is already advancing"},
+                status_code=409,
+            )
+        async with app.state.tick_lock:
+            try:
+                result = player_trade(
+                    app.state.engine.world,
+                    {
+                        "faction_id": request.faction_id,
+                        "offer": request.offer,
+                        "request": request.request,
+                        "risk_level": request.risk_level,
+                    },
+                )
+            except Exception as exc:
+                return _error(exc)
+            payload = serialize_player_state(app.state.engine.world)
+            payload["last_interaction"] = result
+            return payload
+
+    @app.post("/api/player/help")
+    async def help_faction(request: HelpRequest):
+        if app.state.tick_lock.locked():
+            return JSONResponse(
+                {"error": "world is already advancing"},
+                status_code=409,
+            )
+        async with app.state.tick_lock:
+            try:
+                player_help(
+                    app.state.engine.world,
+                    request.model_dump(exclude_none=True),
+                )
+            except Exception as exc:
+                return _error(exc)
+            return serialize_player_state(app.state.engine.world)
 
     return app
+
+
+async def _world_clock(app: FastAPI) -> None:
+    while True:
+        await asyncio.sleep(app.state.tick_seconds)
+        if app.state.tick_lock.locked():
+            continue
+        async with app.state.tick_lock:
+            await app.state.engine.tick()
 
 
 def serialize_state(world: WorldState) -> dict[str, Any]:
@@ -186,6 +316,7 @@ def serialize_state(world: WorldState) -> dict[str, Any]:
         "height": world.height,
         "paused": world.paused,
         "pause_reason": world.pause_reason,
+        "player": world.player.as_dict(),
         "resources": list(RESOURCE_TYPES),
         "weather_types": list(WEATHER_TYPES),
         "tiles": [
@@ -253,6 +384,130 @@ def serialize_state(world: WorldState) -> dict[str, Any]:
             for event in world.events[-80:]
         ],
     }
+
+
+def serialize_player_state(world: WorldState) -> dict[str, Any]:
+    visible = world.player_visible_tiles()
+    known_factions = _player_known_factions(world, visible)
+    visible_faction_ids = {item["faction_id"] for item in known_factions}
+    return {
+        "tick": world.tick,
+        "seed": world.seed,
+        "width": world.width,
+        "height": world.height,
+        "paused": world.paused,
+        "pause_reason": world.pause_reason,
+        "resources": list(RESOURCE_TYPES),
+        "weather_types": list(WEATHER_TYPES),
+        "player": world.player.as_dict(),
+        "visible_bounds": _visible_bounds(visible),
+        "tiles": [
+            _tile_payload(world, world.tile_at(x, y), visible=True)
+            for x, y in sorted(visible, key=lambda item: (item[1], item[0]))
+        ],
+        "known_factions": known_factions,
+        "nearby_interactions": nearby_interactions(world),
+        "petitions": [
+            petition.as_dict()
+            for petition in world.petitions
+            if petition.status == "pending"
+            and petition.faction_id in visible_faction_ids
+        ],
+        "god_chats": [
+            message.as_dict()
+            for message in world.god_chats[-80:]
+            if message.faction_id in visible_faction_ids
+        ],
+        "events": [
+            event.as_dict()
+            for event in world.events[-80:]
+            if _event_is_player_visible(event, visible_faction_ids)
+        ],
+    }
+
+
+def _tile_payload(world: WorldState, tile, *, visible: bool) -> dict[str, Any]:
+    return {
+        "x": tile.x,
+        "y": tile.y,
+        "visible": visible,
+        "terrain": tile.terrain,
+        "owner": tile.owner,
+        "home_of": world.home_of_tile(tile.x, tile.y),
+        "weather": tile.weather,
+        "weather_duration": tile.weather_duration,
+        "population": dict(tile.population),
+        "soldiers": dict(tile.soldiers),
+        "professions": {
+            faction_id: tile.professions_of(faction_id)
+            for faction_id in tile.population
+        },
+        "houses": tile.houses,
+        "capacity": tile.capacity(),
+        "protected": tile.protected,
+    }
+
+
+def _player_known_factions(
+    world: WorldState,
+    visible: set[tuple[int, int]],
+) -> list[dict[str, Any]]:
+    faction_ids = {
+        world.tile_at(x, y).owner
+        for x, y in visible
+        if world.tile_at(x, y).owner is not None
+    }
+    faction_ids.update(world.player.contacted_factions)
+    summaries = []
+    for faction_id in sorted(faction_id for faction_id in faction_ids if faction_id in world.factions):
+        faction = world.factions[faction_id]
+        visible_tiles = [
+            world.tile_at(x, y)
+            for x, y in visible
+            if world.tile_at(x, y).owner == faction_id
+        ]
+        summaries.append(
+            {
+                "faction_id": faction_id,
+                "name": faction.name,
+                "leader_name": faction.leader_name,
+                "contacted": faction_id in world.player.contacted_factions,
+                "visible_territory_count": len(visible_tiles),
+                "visible_population": sum(tile.population_of(faction_id) for tile in visible_tiles),
+                "visible_soldiers": sum(tile.soldiers_of(faction_id) for tile in visible_tiles),
+                "eliminated": faction.eliminated,
+                "last_plan_summary": faction.last_plan_snapshot.get("strategy_summary", ""),
+            }
+        )
+    return summaries
+
+
+def _visible_bounds(visible: set[tuple[int, int]]) -> dict[str, int]:
+    if not visible:
+        return {"min_x": 0, "max_x": 0, "min_y": 0, "max_y": 0}
+    xs = [x for x, _y in visible]
+    ys = [y for _x, y in visible]
+    return {
+        "min_x": min(xs),
+        "max_x": max(xs),
+        "min_y": min(ys),
+        "max_y": max(ys),
+    }
+
+
+def _event_is_player_visible(event, visible_faction_ids: set[str]) -> bool:
+    if event.kind in {"world", "tick", "player", "player_trade", "player_help"}:
+        return True
+    if event.faction_id is None:
+        return True
+    return event.faction_id in visible_faction_ids
+
+
+def _has_llm_env() -> bool:
+    enabled = os.getenv("USE_LLM_LEADERS", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return False
+    return bool(os.getenv("MODEL_API_KEY") or os.getenv("OPENAI_API_KEY"))
 
 
 def _error(exc: Exception) -> JSONResponse:

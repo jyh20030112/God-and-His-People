@@ -15,6 +15,15 @@ from game.npc import NPCExecutor
 from game.rules import RuleEngine
 from game.world import WorldState, create_default_world
 
+IMPORTANT_EVENT_KINDS = {
+    "battle",
+    "discovery",
+    "elimination",
+    "petition",
+    "player_trade",
+    "player_help",
+}
+
 
 class LeaderControllerProtocol(Protocol):
     faction_id: str
@@ -35,20 +44,30 @@ class GameEngine:
         world: WorldState | None = None,
         *,
         leaders: dict[str, LeaderControllerProtocol] | None = None,
-        strategy_interval: int = 5,
+        strategy_interval: int | None = 5,
+        backup_strategy_interval: int = 20,
+        event_driven_strategy: bool = False,
         retry_limit: int = 4,
         rules: RuleEngine | None = None,
         npc: NPCExecutor | None = None,
         log_ticks: bool = False,
     ) -> None:
-        if strategy_interval <= 0:
+        if strategy_interval is not None and strategy_interval <= 0:
             raise ValueError("strategy_interval must be positive")
+        if backup_strategy_interval <= 0:
+            raise ValueError("backup_strategy_interval must be positive")
         if retry_limit < 0:
             raise ValueError("retry_limit must not be negative")
 
         self.world = world or create_default_world()
         self.leaders = leaders or {}
         self.strategy_interval = strategy_interval
+        self.backup_strategy_interval = backup_strategy_interval
+        self.event_driven_strategy = event_driven_strategy
+        self.last_strategy_ticks: dict[str, int] = {
+            faction_id: 0 for faction_id in self.world.factions
+        }
+        self.last_strategy_event_index = len(self.world.events)
         self.retry_limit = retry_limit
         self.rules = rules or RuleEngine()
         self.npc = npc or NPCExecutor()
@@ -70,30 +89,87 @@ class GameEngine:
             self.world.enforce_population_ownership()
             self._record_discoveries()
 
-            if self.world.tick % self.strategy_interval == 0:
+            due_factions = self._strategy_due_factions(event_start)
+            if due_factions:
                 strategy_event_start = len(self.world.events)
-                strategy_records = await self._run_strategic_turns()
+                strategy_records = await self._run_strategic_turns(due_factions)
                 if self.world.paused:
                     break
-                for faction_id in sorted(self.world.factions):
+                execute_ids = (
+                    sorted(due_factions)
+                    if self.event_driven_strategy
+                    else sorted(self.world.factions)
+                )
+                for faction_id in execute_ids:
                     self.npc.execute_active_orders(self.world, faction_id)
                 self.world.enforce_population_ownership()
                 self._record_discoveries()
+                for faction_id in strategy_records:
+                    self.last_strategy_ticks[faction_id] = self.world.tick
                 await self._record_and_compress_strategy_contexts(
                     strategy_records,
                     strategy_event_start,
                 )
+                if self.event_driven_strategy:
+                    self.last_strategy_event_index = len(self.world.events)
 
             self.world.add_event("tick", f"Tick {self.world.tick} completed")
             if self.log_ticks:
                 self._log_tick(event_start)
         return self.world
 
-    async def _run_strategic_turns(self) -> dict[str, dict[str, Any]]:
-        faction_ids = sorted(
+    def _strategy_due_factions(self, event_start: int) -> list[str]:
+        live_factions = sorted(
             faction_id
             for faction_id, faction in self.world.factions.items()
             if not faction.eliminated
+        )
+        if not self.event_driven_strategy:
+            if self.strategy_interval is None:
+                return []
+            if self.world.tick % self.strategy_interval == 0:
+                return live_factions
+            return []
+
+        due: set[str] = set()
+        recent_events = self.world.events[self.last_strategy_event_index:]
+        for event in recent_events:
+            if event.kind not in IMPORTANT_EVENT_KINDS:
+                continue
+            if event.faction_id in self.world.factions and not self.world.factions[event.faction_id].eliminated:
+                due.add(event.faction_id)
+            elif event.kind in {"battle", "elimination"}:
+                due.update(live_factions)
+
+        for petition in self.world.petitions:
+            if (
+                petition.status == "pending"
+                and petition.urgency == "high"
+                and petition.faction_id in self.world.factions
+                and not self.world.factions[petition.faction_id].eliminated
+                and petition.created_tick >= self.last_strategy_ticks.get(petition.faction_id, 0)
+            ):
+                due.add(petition.faction_id)
+
+        for faction_id in live_factions:
+            last_tick = self.last_strategy_ticks.get(faction_id, 0)
+            if self.world.tick - last_tick >= self.backup_strategy_interval:
+                due.add(faction_id)
+        return sorted(due)
+
+    async def _run_strategic_turns(
+        self,
+        faction_ids: list[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        faction_ids = sorted(
+            faction_id
+            for faction_id in (
+                faction_ids
+                if faction_ids is not None
+                else self.world.factions.keys()
+            )
+            if faction_id in self.world.factions
+            and not self.world.factions[faction_id].eliminated
         )
         for faction_id in faction_ids:
             controller = self.leaders.get(faction_id)

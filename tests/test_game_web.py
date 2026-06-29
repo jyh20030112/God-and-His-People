@@ -1,10 +1,11 @@
 import asyncio
 import unittest
+from unittest.mock import patch
 
 import httpx
 
-from game import GameEngine, LeaderDecision, create_default_world
-from game.web import STATIC_DIR, create_game_app
+from game import GameEngine, LeaderDecision, ScriptedLeaderController, create_default_world
+from game.web import STATIC_DIR, create_engine, create_game_app
 
 
 class WebLeader:
@@ -65,23 +66,43 @@ class GameWebTests(unittest.TestCase):
             leaders=leaders,
             strategy_interval=strategy_interval,
         )
-        return AppClient(create_game_app(engine))
+        return AppClient(create_game_app(engine, auto_start=False))
 
     def test_index_page_is_localized_to_chinese(self) -> None:
         text = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
-        self.assertIn("上帝模拟器", text)
-        self.assertIn("推进 5 刻", text)
+        self.assertIn("带回神性", text)
+        self.assertIn("WASD / 方向按钮移动", text)
+        self.assertIn("高风险交易", text)
+        self.assertIn("有限援助", text)
+        self.assertNotIn("推进 1 刻", text)
+        self.assertNotIn("推进 5 刻", text)
         self.assertNotIn("claimFactionSelect", text)
         self.assertNotIn("划给领土", text)
         self.assertNotIn("/api/god/claim", text)
-        self.assertIn("weatherDuration", text)
-        self.assertIn("祈求", text)
-        self.assertIn("神谕私聊", text)
-        self.assertIn("godChatFactionSelect", text)
-        self.assertIn("发送神谕", text)
+        self.assertNotIn("/api/debug/state", text)
+        self.assertIn("tradeFaction", text)
+        self.assertIn("helpKind", text)
 
-    def test_state_endpoint_returns_renderable_world(self) -> None:
+    def test_web_engine_defaults_to_scripted_leaders_without_explicit_llm_mode(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "MODEL_API_KEY": "present-but-not-enabled",
+                "OPENAI_API_KEY": "present-but-not-enabled",
+            },
+            clear=True,
+        ):
+            engine = create_engine(width=12, height=8, seed=3)
+
+        self.assertTrue(
+            all(
+                isinstance(leader, ScriptedLeaderController)
+                for leader in engine.leaders.values()
+            )
+        )
+
+    def test_state_endpoint_returns_local_explorer_world(self) -> None:
         client = self.make_client()
 
         response = client.get("/api/state")
@@ -91,33 +112,25 @@ class GameWebTests(unittest.TestCase):
         self.assertEqual(payload["width"], 12)
         self.assertEqual(payload["height"], 8)
         self.assertEqual(payload["tick"], 0)
-        self.assertEqual(len(payload["tiles"]), 96)
+        self.assertIn("player", payload)
+        self.assertIn("visible_bounds", payload)
+        self.assertIn("known_factions", payload)
+        self.assertIn("nearby_interactions", payload)
+        self.assertNotIn("factions", payload)
+        self.assertLess(len(payload["tiles"]), 96)
+        self.assertTrue(all(tile["visible"] for tile in payload["tiles"]))
         self.assertIn("professions", payload["tiles"][0])
         self.assertIn("houses", payload["tiles"][0])
         self.assertIn("capacity", payload["tiles"][0])
         self.assertIn("home_of", payload["tiles"][0])
         self.assertIn("weather_duration", payload["tiles"][0])
-        self.assertEqual(
-            {faction["faction_id"] for faction in payload["factions"]},
-            {"human", "elf", "orc"},
-        )
-        human = next(
-            faction
-            for faction in payload["factions"]
-            if faction["faction_id"] == "human"
-        )
-        self.assertIn("jobs", human)
-        self.assertIn("houses", human)
-        self.assertIn("population_capacity", human)
-        self.assertIn("known_factions", human)
-        self.assertIn("last_plan_snapshot", human)
-        self.assertIn("leader_memory", human)
-        self.assertIn("leader_context_window_count", human)
-        self.assertIn("home_tile", human)
-        self.assertIn("eliminated", human)
-        self.assertEqual(payload["god_chats"], [])
+        player = payload["player"]
+        self.assertIn("divine_power", player)
+        self.assertIn("inventory", player)
+        self.assertIn("godhood_progress", player)
+        self.assertIn("discovered_tiles_count", player)
 
-    def test_state_endpoint_exposes_contract_used_by_godot_client(self) -> None:
+    def test_debug_state_endpoint_exposes_full_world_contract(self) -> None:
         client = self.make_client()
         engine = client.app.state.engine
         engine.world.add_petition(
@@ -143,7 +156,7 @@ class GameWebTests(unittest.TestCase):
             faction_id="human",
         )
 
-        response = client.get("/api/state")
+        response = client.get("/api/debug/state")
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -225,6 +238,29 @@ class GameWebTests(unittest.TestCase):
         )
         self.assertEqual(event["kind"], "god")
 
+    def test_local_state_does_not_leak_far_world_information(self) -> None:
+        client = self.make_client()
+
+        local = client.get("/api/state").json()
+        debug = client.get("/api/debug/state").json()
+
+        self.assertLess(len(local["tiles"]), len(debug["tiles"]))
+        local_coords = {(tile["x"], tile["y"]) for tile in local["tiles"]}
+        visible = {
+            (x, y)
+            for y in range(
+                local["player"]["y"] - local["player"]["vision_radius"],
+                local["player"]["y"] + local["player"]["vision_radius"] + 1,
+            )
+            for x in range(
+                local["player"]["x"] - local["player"]["vision_radius"],
+                local["player"]["x"] + local["player"]["vision_radius"] + 1,
+            )
+            if abs(local["player"]["x"] - x) + abs(local["player"]["y"] - y)
+            <= local["player"]["vision_radius"]
+        }
+        self.assertTrue(local_coords.issubset(visible))
+
     def test_god_mutation_endpoints_return_updated_state(self) -> None:
         client = self.make_client()
 
@@ -239,16 +275,10 @@ class GameWebTests(unittest.TestCase):
 
         self.assertEqual(give.status_code, 200)
         self.assertEqual(weather.status_code, 200)
-        payload = weather.json()
-        human = next(
-            faction
-            for faction in payload["factions"]
-            if faction["faction_id"] == "human"
-        )
-        tile = payload["tiles"][0]
-        self.assertEqual(human["resources"]["food"], 127)
-        self.assertEqual(tile["weather"], "storm")
-        self.assertEqual(tile["weather_duration"], 4)
+        world = client.app.state.engine.world
+        self.assertEqual(world.factions["human"].resources.food, 127)
+        self.assertEqual(world.tile_at(0, 0).weather, "storm")
+        self.assertEqual(world.tile_at(0, 0).weather_duration, 4)
 
     def test_god_claim_endpoint_is_removed(self) -> None:
         client = self.make_client()
@@ -311,6 +341,83 @@ class GameWebTests(unittest.TestCase):
         self.assertEqual(engine.world.total_soldiers("human"), before_soldiers)
         self.assertEqual(len(engine.world.faction_tiles("human")), before_territory)
         self.assertEqual(engine.world.factions["human"].active_orders, {})
+
+    def test_player_move_changes_position_and_reveals_tiles(self) -> None:
+        client = self.make_client()
+        world = client.app.state.engine.world
+        direction = _first_passable_direction(world)
+        before = world.player.as_dict()
+
+        response = client.post("/api/player/move", json={"direction": direction})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertNotEqual(
+            (payload["player"]["x"], payload["player"]["y"]),
+            (before["x"], before["y"]),
+        )
+        self.assertLess(payload["player"]["divine_power"], before["divine_power"])
+        self.assertGreaterEqual(
+            payload["player"]["discovered_tiles_count"],
+            before["discovered_tiles_count"],
+        )
+
+    def test_player_move_rejects_impassable_tile(self) -> None:
+        client = self.make_client()
+        world = client.app.state.engine.world
+        direction, target = _first_neighbor(world)
+        world.tile_at(*target).terrain = "water"
+
+        response = client.post("/api/player/move", json={"direction": direction})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("cannot move into water or mountain", response.json()["error"])
+
+    def test_player_help_spends_inventory_and_updates_faction(self) -> None:
+        client = self.make_client()
+        world = client.app.state.engine.world
+        _put_player_on_faction_land(world, "human")
+        before_inventory = world.player.inventory.food
+        before_faction_food = world.factions["human"].resources.food
+
+        response = client.post(
+            "/api/player/help",
+            json={
+                "kind": "resources",
+                "faction_id": "human",
+                "resource": "food",
+                "amount": 10,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(world.player.inventory.food, before_inventory - 10)
+        self.assertEqual(world.factions["human"].resources.food, before_faction_food + 10)
+        self.assertTrue(any(event.kind == "player_help" for event in world.events))
+
+    def test_player_trade_spends_offer_and_advances_godhood(self) -> None:
+        client = self.make_client()
+        world = client.app.state.engine.world
+        _put_player_on_faction_land(world, "human")
+        before_inventory = world.player.inventory.food
+        before_progress = world.player.godhood_progress
+
+        response = client.post(
+            "/api/player/trade",
+            json={
+                "faction_id": "human",
+                "risk_level": "low",
+                "offer": {"resource": "food", "amount": 5},
+                "request": {"kind": "faith"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["last_interaction"]["success"])
+        self.assertEqual(world.player.inventory.food, before_inventory - 5)
+        self.assertGreater(world.player.godhood_progress, before_progress)
+        self.assertTrue(any(event.kind == "player_trade" for event in world.events))
 
     def test_god_chat_endpoint_rejects_invalid_requests(self) -> None:
         client = self.make_client()
@@ -410,6 +517,42 @@ class GameWebTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("unknown faction", response.json()["error"])
+
+
+def _first_neighbor(world):
+    directions = {
+        "north": (0, -1),
+        "south": (0, 1),
+        "west": (-1, 0),
+        "east": (1, 0),
+    }
+    for direction, (dx, dy) in directions.items():
+        target = (world.player.x + dx, world.player.y + dy)
+        if world.in_bounds(*target):
+            return direction, target
+    raise AssertionError("player has no in-bounds neighbor")
+
+
+def _first_passable_direction(world) -> str:
+    directions = {
+        "north": (0, -1),
+        "south": (0, 1),
+        "west": (-1, 0),
+        "east": (1, 0),
+    }
+    for direction, (dx, dy) in directions.items():
+        target = (world.player.x + dx, world.player.y + dy)
+        if world.in_bounds(*target) and world.tile_at(*target).is_passable():
+            return direction
+    raise AssertionError("player has no passable neighbor")
+
+
+def _put_player_on_faction_land(world, faction_id: str) -> None:
+    tile = world.faction_tiles(faction_id)[0]
+    world.player.x = tile.x
+    world.player.y = tile.y
+    world.reveal_player_area()
+    world.update_player_contacts()
 
 
 if __name__ == "__main__":

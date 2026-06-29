@@ -3,107 +3,137 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>上帝模拟器</title>
+    <title>带回神性</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <main class="shell">
-      <section class="map-pane">
+      <section class="world-pane">
         <header class="topbar">
           <div>
-            <h1>上帝模拟器</h1>
-            <p id="worldMeta">第 0 刻</p>
+            <h1>带回神性</h1>
+            <p id="worldMeta">连接世界中...</p>
           </div>
-          <div class="tick-controls">
-            <button id="tickOne" type="button">推进 1 刻</button>
-            <button id="tickFive" type="button">推进 5 刻</button>
-          </div>
+          <div id="clockState" class="clock-state">自动时钟</div>
         </header>
 
         <div id="pauseBanner" class="pause-banner" hidden></div>
-        <section id="strategyWait" class="strategy-wait" aria-live="polite" hidden>
-          <div class="strategy-wait-header">
-            <div>
-              <div class="strategy-wait-kicker">战略时刻</div>
-              <h2 id="strategyWaitTitle">首领正在思考</h2>
-            </div>
-            <div id="strategyWaitElapsed" class="strategy-wait-elapsed">0s</div>
-          </div>
-          <div class="strategy-progress" aria-hidden="true">
-            <div id="strategyProgressBar"></div>
-          </div>
-          <p id="strategyWaitStage" class="strategy-wait-stage">三位首领正在评估局势。</p>
-          <div id="leaderWaitList" class="leader-wait-list"></div>
-          <div class="strategy-wait-hint">等待期间仍可查看地图、事件与各族档案；完成后会自动刷新。</div>
+
+        <section class="map-stage" aria-label="局部地图">
+          <canvas id="worldCanvas" width="960" height="640"></canvas>
+          <div id="tileTip" class="tile-tip" hidden></div>
         </section>
-        <canvas id="worldCanvas" width="960" height="640"></canvas>
-        <div id="tileTip" class="tile-tip" hidden></div>
 
-        <section class="god-tools" aria-label="上帝工具">
-          <div class="tool-group">
-            <label>
-              赐给
-              <select id="factionSelect"></select>
-            </label>
-            <label>
-              资源
-              <select id="resourceSelect"></select>
-            </label>
-            <label>
-              数量
-              <input id="resourceAmount" type="number" min="1" value="50" />
-            </label>
-            <button id="giveButton" type="button">赐予</button>
+        <section class="movement-panel" aria-label="移动">
+          <div class="move-grid">
+            <button class="move-button" data-direction="north" type="button">北</button>
+            <button class="move-button" data-direction="west" type="button">西</button>
+            <button class="move-button center" type="button" disabled>你</button>
+            <button class="move-button" data-direction="east" type="button">东</button>
+            <button class="move-button" data-direction="south" type="button">南</button>
           </div>
-
-          <div class="tool-group">
-            <label>
-              X 横向
-              <input id="coordX" type="number" min="0" value="0" />
-            </label>
-            <label>
-              Y 纵向
-              <input id="coordY" type="number" min="0" value="0" />
-            </label>
-            <label>
-              天气
-              <select id="weatherSelect"></select>
-            </label>
-            <label>
-              持续
-              <input id="weatherDuration" type="number" min="0" max="50" value="5" />
-            </label>
-            <button id="weatherButton" type="button">改变天气</button>
+          <div class="movement-copy">
+            <strong>WASD / 方向按钮移动</strong>
+            <span>世界会自行推进；首领只在危机、交易或保底时刻做战略决策。</span>
           </div>
         </section>
       </section>
 
       <aside class="side-pane">
         <section class="panel">
-          <h2>种族</h2>
-          <div id="factions"></div>
+          <h2>探索者</h2>
+          <div id="playerStats" class="stat-grid"></div>
+          <div id="inventory" class="inventory"></div>
         </section>
 
         <section class="panel">
-          <h2>祈求</h2>
-          <div id="petitions"></div>
+          <h2>可见文明</h2>
+          <div id="knownFactions"></div>
         </section>
 
-        <section class="panel god-chat-panel">
-          <h2>神谕私聊</h2>
-          <label>
-            首领
-            <select id="godChatFactionSelect"></select>
-          </label>
-          <div id="godChatMessages" class="god-chat-messages"></div>
-          <div class="god-chat-compose">
-            <textarea id="godChatInput" rows="3" placeholder="例如：若你攻打兽人，我会赐予粮食和木材。"></textarea>
-            <button id="godChatButton" type="button">发送神谕</button>
+        <section class="panel">
+          <h2>高风险交易</h2>
+          <div class="form-grid">
+            <label>
+              文明
+              <select id="tradeFaction"></select>
+            </label>
+            <label>
+              风险
+              <select id="riskLevel">
+                <option value="low">低风险</option>
+                <option value="medium">中风险</option>
+                <option value="high">高风险</option>
+              </select>
+            </label>
+            <label>
+              给予资源
+              <select id="offerResource"></select>
+            </label>
+            <label>
+              给予数量
+              <input id="offerAmount" type="number" min="1" value="10" />
+            </label>
+            <label>
+              请求
+              <select id="requestKind">
+                <option value="faith">信仰</option>
+                <option value="resource">资源</option>
+                <option value="intel">情报</option>
+                <option value="peace">停战</option>
+              </select>
+            </label>
+            <label>
+              请求资源
+              <select id="requestResource"></select>
+            </label>
+            <label>
+              请求数量
+              <input id="requestAmount" type="number" min="1" value="10" />
+            </label>
           </div>
+          <button id="tradeButton" type="button">提出交易</button>
+          <p id="tradeHint" class="hint">靠近文明领地后才能交易。</p>
+        </section>
+
+        <section class="panel">
+          <h2>有限援助</h2>
+          <div class="form-grid">
+            <label>
+              类型
+              <select id="helpKind">
+                <option value="resources">赐资源</option>
+                <option value="weather">改天气</option>
+                <option value="protection">庇护地块</option>
+              </select>
+            </label>
+            <label>
+              文明
+              <select id="helpFaction"></select>
+            </label>
+            <label>
+              资源
+              <select id="helpResource"></select>
+            </label>
+            <label>
+              数量
+              <input id="helpAmount" type="number" min="1" value="10" />
+            </label>
+            <label>
+              天气
+              <select id="helpWeather"></select>
+            </label>
+            <label>
+              持续
+              <input id="helpDuration" type="number" min="0" max="20" value="5" />
+            </label>
+          </div>
+          <button id="helpButton" type="button">执行援助</button>
+          <p id="selectedTileText" class="hint">天气和庇护会作用于当前选中地块；未选中时作用于脚下。</p>
         </section>
 
         <section class="panel events-panel">
-          <h2>事件</h2>
+          <h2>旅途事件</h2>
           <div id="events"></div>
         </section>
       </aside>

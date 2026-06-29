@@ -14,6 +14,7 @@ from game import (
     LeaderToolHandler,
     NPCExecutor,
     RuleEngine,
+    ScriptedLeaderController,
     create_default_world,
     render_inbox,
     render_map,
@@ -2128,6 +2129,64 @@ class GameTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("第 1 刻阵营 | human", output)
         self.assertIn("人口=", output)
         self.assertIn("资源=", output)
+
+    async def test_event_driven_engine_uses_backup_strategy_interval(self) -> None:
+        world = create_default_world(seed=71)
+        leaders = {
+            faction_id: DelayedLeader(faction_id, delay=0)
+            for faction_id in world.factions
+        }
+        engine = GameEngine(
+            world,
+            leaders=leaders,
+            strategy_interval=None,
+            backup_strategy_interval=3,
+            event_driven_strategy=True,
+        )
+
+        await engine.tick(2)
+
+        self.assertTrue(all(leader.calls == 0 for leader in leaders.values()))
+
+        await engine.tick()
+
+        self.assertFalse(world.paused)
+        self.assertTrue(all(leader.calls == 1 for leader in leaders.values()))
+
+    async def test_event_driven_engine_responds_to_player_trade_event(self) -> None:
+        world = create_default_world(seed=72)
+        leaders = {
+            faction_id: DelayedLeader(faction_id, delay=0)
+            for faction_id in world.factions
+        }
+        engine = GameEngine(
+            world,
+            leaders=leaders,
+            strategy_interval=None,
+            backup_strategy_interval=99,
+            event_driven_strategy=True,
+        )
+        world.add_event(
+            "player_trade",
+            "Player struck a low trade with human; godhood +8",
+            faction_id="human",
+        )
+
+        await engine.tick()
+
+        self.assertEqual(leaders["human"].calls, 1)
+        self.assertEqual(leaders["elf"].calls, 0)
+        self.assertEqual(leaders["orc"].calls, 0)
+
+    async def test_scripted_leader_controller_submits_legal_fallback_plan(self) -> None:
+        world = create_default_world(seed=73)
+        controller = ScriptedLeaderController("human")
+        decision = await controller.decide(world)
+
+        check = RuleEngine().validate_decision(world, "human", decision)
+
+        self.assertTrue(check.accepted, check.errors)
+        self.assertEqual(controller.calls, 1)
 
     async def test_engine_retries_idle_budget_feedback_then_accepts(self) -> None:
         world = create_default_world(seed=30)

@@ -200,6 +200,32 @@ class GodChatMessage:
         }
 
 
+@dataclass(slots=True)
+class PlayerState:
+    x: int = 0
+    y: int = 0
+    vision_radius: int = 4
+    divine_power: int = 100
+    inventory: ResourceStockpile = field(
+        default_factory=lambda: ResourceStockpile(food=40, wood=20, stone=10)
+    )
+    discovered_tiles: set[tuple[int, int]] = field(default_factory=set)
+    contacted_factions: set[str] = field(default_factory=set)
+    godhood_progress: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "x": self.x,
+            "y": self.y,
+            "vision_radius": self.vision_radius,
+            "divine_power": self.divine_power,
+            "inventory": self.inventory.as_dict(),
+            "godhood_progress": self.godhood_progress,
+            "discovered_tiles_count": len(self.discovered_tiles),
+            "contacted_factions": sorted(self.contacted_factions),
+        }
+
+
 def default_leader_memory() -> dict[str, Any]:
     return {
         "god_dialogue": [],
@@ -237,6 +263,7 @@ class WorldState:
     events: list[GameEvent] = field(default_factory=list)
     petitions: list[Petition] = field(default_factory=list)
     god_chats: list[GodChatMessage] = field(default_factory=list)
+    player: PlayerState = field(default_factory=PlayerState)
     paused: bool = False
     pause_reason: str | None = None
     _next_petition_id: int = 1
@@ -317,6 +344,35 @@ class WorldState:
 
     def is_visible(self, faction_id: str, x: int, y: int) -> bool:
         return (x, y) in self.visible_tiles(faction_id)
+
+    def player_visible_tiles(self, radius: int | None = None) -> set[tuple[int, int]]:
+        view_radius = self.player.vision_radius if radius is None else radius
+        visible: set[tuple[int, int]] = set()
+        origin = (self.player.x, self.player.y)
+        for y in range(self.player.y - view_radius, self.player.y + view_radius + 1):
+            for x in range(self.player.x - view_radius, self.player.x + view_radius + 1):
+                if self.in_bounds(x, y) and _manhattan(origin, (x, y)) <= view_radius:
+                    visible.add((x, y))
+        return visible
+
+    def player_can_see(self, x: int, y: int) -> bool:
+        return (x, y) in self.player_visible_tiles()
+
+    def reveal_player_area(self) -> list[tuple[int, int]]:
+        visible = self.player_visible_tiles()
+        newly_seen = sorted(visible - self.player.discovered_tiles)
+        self.player.discovered_tiles.update(visible)
+        return newly_seen
+
+    def update_player_contacts(self) -> list[str]:
+        contacts: list[str] = []
+        for x, y in sorted(self.player_visible_tiles()):
+            owner = self.tile_at(x, y).owner
+            if owner is None or owner in self.player.contacted_factions:
+                continue
+            self.player.contacted_factions.add(owner)
+            contacts.append(owner)
+        return contacts
 
     def discover_factions(self) -> list[tuple[str, str]]:
         discoveries: list[tuple[str, str]] = []
@@ -571,12 +627,38 @@ def create_default_world(
         _seed_faction_land(world, faction_id, start)
 
     world.discover_factions()
+    _place_player(world)
 
     world.add_event(
         "world",
         f"World created with seed {seed}, {width}x{height} tiles",
     )
     return world
+
+
+def _place_player(world: WorldState) -> None:
+    center = (world.width // 2, world.height // 2)
+    candidates = sorted(
+        world.tiles,
+        key=lambda tile: (
+            _manhattan((tile.x, tile.y), center),
+            tile.y,
+            tile.x,
+        ),
+    )
+    for tile in candidates:
+        if tile.is_passable() and tile.owner is None:
+            world.player.x = tile.x
+            world.player.y = tile.y
+            break
+    else:
+        for tile in candidates:
+            if tile.is_passable():
+                world.player.x = tile.x
+                world.player.y = tile.y
+                break
+    world.reveal_player_area()
+    world.update_player_contacts()
 
 
 def _seed_faction_land(
